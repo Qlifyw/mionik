@@ -46,5 +46,21 @@ Before you begin, ensure you have met the following requirements:
     // handle fail 
     val person: Result<Person, ReflectionError> = morph(Person::class, config)
         .doOnError { /* do something */ }
+
+    // or
+    val person: Result<Person, ReflectionError> = morph(Person::class, config)
+        .orThrow { error -> throw CustomException(error.description) }
+    
+
+    // See also
+
+   val person: Result<Person, ReflectionError> = morph(Person::class, config)
+        .map { /* map value if success */ }
+
+   val person: Result<Person, ReflectionError> = morph(Person::class, config)
+        .mapError { /* convert error */ }
+
+   val person: Result<Person, ReflectionError> = morph(Person::class, config)
+        .bind { /* */ } 
 ```
 
