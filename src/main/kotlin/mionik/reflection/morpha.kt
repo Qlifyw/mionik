@@ -7,12 +7,13 @@ import mionik.errors.ReflectionError
 import mionik.utils.Result
 import mionik.utils.Result.Companion.failure
 import mionik.utils.Result.Companion.success
-import mionik.utils.Result.Failure
-import mionik.utils.Result.Success
+import mionik.utils.asFailure
 import mionik.utils.asSuccess
+import mionik.utils.bind
 import java.math.BigDecimal
 import java.time.LocalDateTime
 import java.util.*
+import java.util.concurrent.ThreadLocalRandom
 import kotlin.reflect.KClass
 import kotlin.reflect.KFunction
 import kotlin.reflect.KParameter
@@ -25,6 +26,7 @@ import kotlin.reflect.jvm.jvmErasure
 
 
 private val EMPTY_CONFIGURATION = configuration {}
+private val charRange = ('a'..'z')
 
 /**
  * Do not call with system type like: UUID, BigDecimal etc
@@ -34,34 +36,32 @@ fun <T : Any> morph(target: KClass<T>, configuration: ConfigurationComposer = EM
     /**
      * for class like UUID, BigDecimal etc. return null, because they dont have primary constructor
      */
+    /**
+     * for class like UUID, BigDecimal etc. return null, because they dont have primary constructor
+     */
     val ctor = target.primaryConstructor
+        ?: return ReflectionError(description = "Cannot create instance of $target, because it have not primary constructor").asFailure()
 
-    val createdInstance = ctor?.let { _ctor ->
-        if (_ctor.parameters.isEmpty())
-            _ctor.tryCall()
-                .orForwardFail { error -> return error }
+    val createdInstance =
+        if (ctor.parameters.isEmpty())
+            ctor
+                .tryCall()
+                .orForwardFail { return it }
         else {
-            val args = prepareConstructorArguments(target, ctor, configuration)
-                .orForwardFail { error -> return error }
-
             /**
              *  Set field, getter, setter  accessible
              *  Example: class Money has private constructor and you can take it,
              *  but can't call because it's private
              */
-            _ctor.isAccessible = true
+            ctor.isAccessible = true
 
-            return _ctor.tryCallBy(args = args)
-                .orForwardFail { error -> return error }
+            return prepareConstructorArguments(target, ctor, configuration)
+                .bind { args -> ctor.tryCallBy(args = args) }
+                .orForwardFail { return it }
                 .asSuccess()
         }
-    }
-        ?: return failure(
-            ReflectionError(description = "Cannot create instance of $target, because it have not primary constructor")
-        )
 
     return success(createdInstance)
-
 }
 
 /**
@@ -70,31 +70,25 @@ fun <T : Any> morph(target: KClass<T>, configuration: ConfigurationComposer = EM
  * @param configuration  configuration used for set behaviour for instance creation
  * @return               Map of pairs Parameter and Value created for this parameter
  */
-private fun <T : Any> prepareConstructorArguments(
+internal fun <T : Any> prepareConstructorArguments(
     target: KClass<T>,
     ctor: KFunction<T>,
     configuration: ConfigurationComposer
-): Result<Map<KParameter, Any?>, ReflectionError> {
+): Result<Map<KParameter, Any?>, ReflectionError> = ctor.parameters
+    .associateWith { parameter ->
+        val classMetadata = ClassMetadata(parameter.name!!, target.createType(), parameter.type)
+        defineValue(classMetadata, configuration).orForwardFail { return it }
+    }
+    .asSuccess()
 
-    val args = ctor.parameters
-        .associate { parameter ->
-            val definedValue = defineValue(parameter.name!!, target.createType(), parameter.type, configuration)
-                .orForwardFail { error -> return error }
+internal fun isNeedToGenerate(type: KType, config: ConfigurationComposer): Boolean =
+    !type.isMarkedNullable || config.constraintsContext.isNullableGenerated
 
-            parameter to definedValue
-        }
+internal fun defineValue(classMetadata: ClassMetadata, configuration: ConfigurationComposer): Result<Any?, ReflectionError> {
+    val parameterName: String = classMetadata.parameterName
+    val parentType: KType = classMetadata.parentType
+    val type: KType = classMetadata.type
 
-    return success(args)
-}
-
-private val isNeedToGenerate: (KType, ConfigurationComposer) -> Boolean = { type, config -> !type.isMarkedNullable || config.constraintsContext.isNullableGenerated }
-
-private fun defineValue(
-    parameterName: String,
-    parentType: KType,
-    type: KType,
-    configuration: ConfigurationComposer
-): Result<Any?, ReflectionError> {
     val jvmErasure = type.jvmErasure
 
     if (!isNeedToGenerate(type, configuration))
@@ -109,60 +103,54 @@ private fun defineValue(
     if (predifinedPropertyValue != null)
         return success(predifinedPropertyValue)
 
-    val value = if (jvmErasure.isSubclassOf(Number::class)) {
-        if (jvmErasure == BigDecimal::class) {
-            BigDecimal.valueOf(configuration.random.nextDouble())
-        } else if (jvmErasure == Integer::class) {
-            configuration.random.nextInt()
-        } else if (jvmErasure == Long::class) {
-            configuration.random.nextLong()
-        } else if (jvmErasure == Float::class) {
-            configuration.random.nextFloat()
-        } else {
-            configuration.random.nextDouble()
-        }
-    } else if (jvmErasure.isSubclassOf(Boolean::class)) {
-        configuration.random.nextBoolean()
-    } else if (jvmErasure.isSubclassOf(Char::class)) {
-        ('a'..'z').random()
-    } else if (jvmErasure.isSubclassOf(String::class)) {
-        jvmErasure.toString()
-    } else if (jvmErasure.isSubclassOf(Enum::class)) {
-        generateEnum(type)
-            .orForwardFail { error -> return error }
-    } else if (jvmErasure.isSubclassOf(Collection::class)) {
-        val clazzResult = getClassByCollectionTypeParameter(type)
-        when (clazzResult) {
-            is Success -> {
-                val itemsAmount = configuration.constraintsContext.itemsInCollection
+    val value = when {
+        jvmErasure.isSubclassOf(Number::class)  -> defineNumber(jvmErasure, configuration.random)
+        jvmErasure.isSubclassOf(Boolean::class) -> configuration.random.nextBoolean()
+        jvmErasure.isSubclassOf(Char::class)    -> charRange.random()
+        jvmErasure.isSubclassOf(String::class)  -> jvmErasure.toString()
+        jvmErasure.isSubclassOf(Enum::class)    -> generateEnum(type).orForwardFail { return it }
 
-                val values = (0 until itemsAmount).map {
-                    defineValue(parameterName, type, clazzResult.get.createType(), configuration)
-                        .orForwardFail { error -> return@map error }
-                }
-
-                if (jvmErasure.isSubclassOf(List::class))
-                    values
-                else if (jvmErasure.isSubclassOf(Set::class))
-                    values.toSet()
-                else
-                    return failure(ReflectionError(description = "Cannot define behaviour for collection type '${jvmErasure}'."))
+        jvmErasure.isSubclassOf(Collection::class) -> {
+            val clazzResult = getClassByCollectionTypeParameter(type).orForwardFail { return it }
+            val itemsAmount = configuration.constraintsContext.itemsInCollection
+            val values = (0 until itemsAmount).map {
+                val metadata = ClassMetadata(parameterName, type, clazzResult.createType())
+                defineValue(metadata, configuration).orForwardFail { return@map it }
             }
-            is Failure -> clazzResult.orForwardFail { error -> return error }
+
+            when {
+                jvmErasure.isSubclassOf(List::class) -> values
+                jvmErasure.isSubclassOf(Set::class)  -> values.toSet()
+                else ->
+                    failure(ReflectionError(description = "Cannot define behaviour for collection type '${jvmErasure}'."))
+            }
         }
 
-    } else if (jvmErasure == LocalDateTime::class) {
-        LocalDateTime.now()
-    } else if (jvmErasure == UUID::class) {
-        UUID.randomUUID()
-    } else if (jvmErasure.isSealed) {
-        val subSealed = jvmErasure.sealedSubclasses.first()
-        defineValue(parameterName, type, subSealed.createType(), configuration)
-            .orForwardFail { error -> return error }
-    } else {
-        morph(type.jvmErasure, configuration)
-            .orForwardFail { error -> return error }
+        jvmErasure == LocalDateTime::class -> LocalDateTime.now()
+        jvmErasure == UUID::class          -> UUID.randomUUID()
+
+        jvmErasure.isSealed -> jvmErasure.sealedSubclasses.first()
+                .let { subSealed -> ClassMetadata(parameterName, type, subSealed.createType()) }
+                .let { metadata -> defineValue(metadata, configuration) }
+                .orForwardFail { return it }
+
+        else -> morph(type.jvmErasure, configuration).orForwardFail { return it }
     }
 
     return value.asSuccess()
 }
+
+internal fun defineNumber(jvmErasure: KClass<*>, random: ThreadLocalRandom): Number =
+     when {
+        jvmErasure == BigDecimal::class -> BigDecimal.valueOf(random.nextDouble())
+        jvmErasure == Integer::class    -> random.nextInt()
+        jvmErasure == Long::class       -> random.nextLong()
+        jvmErasure == Float::class      -> random.nextFloat()
+        else                            -> random.nextDouble()
+    }
+
+internal data class ClassMetadata(
+    val parameterName: String,
+    val parentType: KType,
+    val type: KType
+)
