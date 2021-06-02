@@ -1,9 +1,10 @@
 plugins {
     kotlin("jvm") version "1.3.61"
+    `maven-publish`
 }
 
-group = "org.mionic"
-version = "1.4.1"
+group = "org.mionik"
+version = "1.6.2"
 
 repositories {
     mavenCentral()
@@ -13,7 +14,6 @@ object Versions {
     const val JUPITER_VERSION = "5.6.2"
     const val JACKSON_VERSION = "2.10.1"
 }
-
 
 dependencies {
     implementation(kotlin("stdlib"))
@@ -37,5 +37,23 @@ tasks {
     }
     test {
         useJUnitPlatform()
+    }
+}
+
+publishing {
+    repositories {
+        maven {
+            name = "GitHubPackages"
+            url = uri("https://maven.pkg.github.com/Qlifyw/mionik")
+            credentials {
+                username = project.findProperty("gpr.user") as String? ?: System.getenv("USERNAME")
+                password = project.findProperty("gpr.key") as String? ?: System.getenv("TOKEN")
+            }
+        }
+    }
+    publications {
+        register<MavenPublication>("gpr") {
+            from(components["java"])
+        }
     }
 }

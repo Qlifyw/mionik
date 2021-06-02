@@ -1,2 +1,2 @@
-rootProject.name = "VerboseGenerator"
+rootProject.name = "mionik"
 
